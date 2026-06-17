@@ -164,14 +164,12 @@ int heap_init(HeapData *heap) {
 
     if (heap_start == (void *)-1)
         return HEAP_ERR_MMAP;
+    
+    add_free_chunk(heap_start, heap_size, NULL); // also sets heap->first_free
 
     heap->start = heap_start;
-    heap->first_free = NULL; // will be set by free_list_prepend() in add_free_chunk()
     heap->avail = heap_size;
-
-    add_free_chunk(heap_start, heap_size, NULL);
-
-    g_heap.is_init = true;
+    heap->is_init = true;
 
     return HEAP_OK;
 }
@@ -182,7 +180,7 @@ void *heap_alloc(uint32_t size) {
             return NULL;
     }
 
-    uint32_t aligned_size = ALIGN_TO_16(size + sizeof(Header));
+    uint32_t aligned_size = ALIGN_TO_16(size + 2 * sizeof(Header));
 
     if (g_heap.avail >= aligned_size) {
         HeapChunk *alloced_chunk = find_free_chunk(aligned_size);
@@ -238,7 +236,7 @@ int main() {
         }
     }
 
-    ptr = heap_alloc(74);
+    ptr = heap_alloc(72);
     printf("\n");
     printf("Allocated addr: %p\n", (void *)ptr);
     if (ptr)
