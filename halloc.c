@@ -4,12 +4,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define Header uint32_t
-
 #define ALIGN_TO_16(x) (((x) + 15) / 16 * 16)
-#define PTR_TO_OFFSET(ptr, start) (uint32_t)((char *)(ptr) - (char *)(start))
-#define OFFSET_TO_PTR(offset, start) (HeapChunk *)((char *)(start) + (offset))
-#define PLACE_FOOTER(chunk_start, size, header) (*(Header *)((char *)(chunk_start) + (size) - sizeof(Header)) = (header))
+#define NULL_OFFSET UINT32_MAX
+
+typedef uint32_t Header;
 
 static inline Header pack_header(uint32_t chunk_size, bool is_alloc) {
     return chunk_size | is_alloc;
@@ -33,14 +31,11 @@ enum HEAP_STATUS {
  * the least significant bit of the header is used to
  * indicate whether the chunk is allocated (1) or free (0).
  *
- * next and prev are offsets from the start of the heap,
+ * next and prev are the next and previous element in the free list.
+ * They are offsets from the start of the heap,
  * because representing them as 32-bit integers instead
  * of 64-bit pointers reduces the size of HeapChunk from 24 to 12.
- *
- * NULL pointers are represented as 0 and are contextually
- * distinguished from an actual 0 offset.
- * next can't point backwards, so 0 will always be interpreted as NULL.
- * prev can only be NULL if it's the first chunk.
+ * NULL pointers are represented as UINT32_MAX.
  *
  * When a chunk is allocated, heap_alloc() returns a pointer
  * to the payload, i.e. just after the header.
@@ -64,6 +59,22 @@ typedef struct {
 HeapData g_heap;
 bool g_heap_is_init;
 
+static inline uint32_t ptr_to_offset(void *ptr) {
+    if (!ptr) return NULL_OFFSET;
+    return (char *)ptr - (char *)g_heap.start;
+}
+
+static inline void *offset_to_ptr(uint32_t offset) {
+    if (offset == NULL_OFFSET) return NULL;
+    return (char *)g_heap.start + offset;
+}
+
+static inline void place_footer(HeapChunk *chunk_start, Header header) {
+    uint32_t size = unpack_chunk_size(header);
+
+    *(Header *)((char *)chunk_start + size - sizeof(Header)) = header;
+}
+
 int heap_init(HeapData *heap) {
     if (!heap) return HEAP_ERR_NULL;
 
@@ -80,12 +91,12 @@ int heap_init(HeapData *heap) {
 
     HeapChunk chunk = {
         .header = pack_header(heap->avail, false),
-        .prev = 0,
-        .next = 0,
+        .prev = NULL_OFFSET,
+        .next = NULL_OFFSET,
     };
 
     *(heap->first_free) = chunk;
-    PLACE_FOOTER(heap->start, heap->avail, chunk.header);
+    place_footer(heap->start, chunk.header);
 
     g_heap_is_init = true;
 
@@ -99,7 +110,7 @@ HeapChunk *find_free_chunk(uint32_t alloc_size) {
         if (unpack_chunk_size(curr->header) >= alloc_size) {
             return curr;
         }
-        curr = OFFSET_TO_PTR(curr->next, g_heap.start);
+        curr = offset_to_ptr(curr->next);
     }
 
     return NULL;
@@ -118,25 +129,35 @@ void *heap_alloc(uint32_t size) {
         HeapChunk *alloced_chunk = find_free_chunk(aligned_size);
 
         if (alloced_chunk) {
-            uint32_t remainder_size = unpack_chunk_size(alloced_chunk->header) - aligned_size;
+            // remove allocated chunk from free list
+            HeapChunk *prev = offset_to_ptr(alloced_chunk->prev);
+            HeapChunk *next = offset_to_ptr(alloced_chunk->next);
+            if (prev)
+                prev->next = alloced_chunk->next;
+            else
+                g_heap.first_free = next;
+            if (next) next->prev = alloced_chunk->prev;
 
             // truncate allocated chunk
+            uint32_t remainder_size = unpack_chunk_size(alloced_chunk->header) - aligned_size;
             alloced_chunk->header = pack_header(aligned_size, true);
-            PLACE_FOOTER(alloced_chunk, aligned_size, alloced_chunk->header);
+            place_footer(alloced_chunk, alloced_chunk->header);
 
             if (remainder_size >= sizeof(HeapChunk)) {
                 HeapChunk free_remainder = {
                     .header = pack_header(remainder_size, false),
-                    .next = 0,
-                    .prev = PTR_TO_OFFSET(alloced_chunk, g_heap.start),
+                    .next = ptr_to_offset(g_heap.first_free),
+                    .prev = NULL_OFFSET,
                 };
 
                 // place new free block
-                alloced_chunk->next = PTR_TO_OFFSET((char *)alloced_chunk + aligned_size, g_heap.start);
-                *OFFSET_TO_PTR(alloced_chunk->next, g_heap.start) = free_remainder;
-                PLACE_FOOTER((char *)alloced_chunk + aligned_size, remainder_size, free_remainder.header);
+                HeapChunk *next_free = (HeapChunk *)((char *)alloced_chunk + aligned_size);
+                *next_free = free_remainder;
+                place_footer(next_free, free_remainder.header);
 
-                g_heap.first_free = OFFSET_TO_PTR(alloced_chunk->next, g_heap.start);
+                if (g_heap.first_free)
+                    g_heap.first_free->prev = ptr_to_offset(next_free);
+                g_heap.first_free = next_free;
                 g_heap.avail -= aligned_size;
             } else {
                 g_heap.first_free = NULL;
@@ -161,7 +182,7 @@ int main() {
     printf("Available memory: %d\n", g_heap.avail);
     printf("First chunk->size: %d\n", unpack_chunk_size(g_heap.first_free->header));
 
-    HeapChunk *ptr = heap_alloc(4000);
+    HeapChunk *ptr = heap_alloc(1);
     printf("\n");
     printf("Allocated addr: %p\n", (void *)ptr);
     if (ptr)
@@ -172,13 +193,13 @@ int main() {
     printf("Available memory: %d\n", g_heap.avail);
     if (g_heap.first_free) {
         printf("First chunk size: %d\n", unpack_chunk_size(g_heap.first_free->header));
-        printf("First chunk->prev: %p\n", (void *)OFFSET_TO_PTR(g_heap.first_free->prev, g_heap.start));
+        printf("First chunk->next: %p\n", offset_to_ptr(g_heap.first_free->next));
         if (g_heap.first_free > g_heap.start) {
             printf("Previous chunk size: %d\n", unpack_chunk_size(*((Header *)(g_heap.first_free) - 1)));
         }
     }
 
-    ptr = heap_alloc(1);
+    ptr = heap_alloc(74);
     printf("\n");
     printf("Allocated addr: %p\n", (void *)ptr);
     if (ptr)
@@ -189,7 +210,7 @@ int main() {
     printf("Available memory: %d\n", g_heap.avail);
     if (g_heap.first_free) {
         printf("First chunk size: %d\n", unpack_chunk_size(g_heap.first_free->header));
-        printf("First chunk->prev: %p\n", (void *)OFFSET_TO_PTR(g_heap.first_free->prev, g_heap.start));
+        printf("First chunk->next: %p\n", offset_to_ptr(g_heap.first_free->next));
         if (g_heap.first_free > g_heap.start) {
             printf("Previous chunk size: %d\n", unpack_chunk_size(*((Header *)(g_heap.first_free) - 1)));
         }
