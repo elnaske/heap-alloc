@@ -110,7 +110,11 @@ int free_list_remove(HeapChunk *chunk) {
         prev->next = chunk->next;
     else
         g_heap.first_free = next;
-    if (next) next->prev = chunk->prev;
+
+    if (next)
+        next->prev = chunk->prev;
+
+    g_heap.avail -= unpack_chunk_size(chunk->header);
 
     MARK_ALLOC(chunk->header);
 
@@ -119,13 +123,18 @@ int free_list_remove(HeapChunk *chunk) {
 
 int free_list_prepend(HeapChunk *chunk) {
     if (!chunk) return HEAP_ERR_NULL;
+    
+    MARK_FREE(chunk->header);
+    chunk->prev = NULL_OFFSET;
+    chunk->next = NULL_OFFSET;
 
-    if (g_heap.first_free)
+    if (g_heap.first_free) {
+        chunk->next = ptr_to_offset(g_heap.first_free);
         g_heap.first_free->prev = ptr_to_offset(chunk);
+    }
 
     g_heap.first_free = chunk;
-
-    MARK_FREE(chunk->header);
+    g_heap.avail += unpack_chunk_size(chunk->header);
 
     return HEAP_OK;
 }
@@ -164,11 +173,12 @@ int heap_init(HeapData *heap) {
 
     if (heap_start == (void *)-1)
         return HEAP_ERR_MMAP;
-    
-    add_free_chunk(heap_start, heap_size, NULL); // also sets heap->first_free
 
     heap->start = heap_start;
-    heap->avail = heap_size;
+    heap->avail = 0;
+
+    add_free_chunk(heap_start, heap_size, NULL); // also sets heap->first_free and heap->avail
+
     heap->is_init = true;
 
     return HEAP_OK;
@@ -198,8 +208,6 @@ void *heap_alloc(uint32_t size) {
                 add_free_chunk(next_free, remainder_size, g_heap.first_free);
             }
 
-            g_heap.avail -= aligned_size;
-
             // skip header, return address to payload
             return (char *)alloced_chunk + sizeof(Header);
         }
@@ -208,51 +216,109 @@ void *heap_alloc(uint32_t size) {
     return NULL;
 }
 
-void heap_free(void *ptr);
+void heap_free(void *ptr) {
+    if (!ptr) return;
+
+    Header *header = (Header *)ptr - 1;
+
+    if (header && is_alloc(*header)) {
+        Header *next = (Header *)(void *)((char *)header + unpack_chunk_size(*header));
+        Header *prev = header - 1; // previous chunk's footer
+
+        if (is_alloc(*next) && is_alloc(*prev)) {
+            MARK_FREE(*header);
+            free_list_prepend((HeapChunk *)header);
+        } else if (is_alloc(*next) && !is_alloc(*prev)) {
+            // coalesce with prev
+            printf("TODO 1\n");
+        } else if (!is_alloc(*next) && is_alloc(*prev)) {
+            // coalesce with next
+            printf("TODO 2\n");
+        } else {
+            // coalesce with prev AND next
+            printf("TODO 3\n");
+        }
+    }
+
+    return;
+}
+
+static void print_free_list(HeapData *heap) {
+    if (!heap) return;
+
+    HeapChunk *curr = heap->first_free;
+
+    if (!curr)
+        printf("(empty)\n");
+
+    while (curr) {
+        printf("Addr: %p\tSize: %u\n", (void *)curr, unpack_chunk_size(curr->header));
+        curr = offset_to_ptr(curr->next);
+    }
+    printf("\n");
+}
 
 int main() {
     heap_init(&g_heap);
 
     printf("Heap start: %p\n", (void *)g_heap.start);
-    printf("First free chunk: %p\n", (void *)g_heap.first_free);
     printf("Available memory: %d\n", g_heap.avail);
-    printf("First chunk->size: %d\n", unpack_chunk_size(g_heap.first_free->header));
 
-    HeapChunk *ptr = heap_alloc(4000);
+    print_free_list(&g_heap);
+    
+    HeapChunk *ptr = heap_alloc(8);
     printf("\n");
     printf("Allocated addr: %p\n", (void *)ptr);
     if (ptr)
         printf("Allocated size: %d\n", unpack_chunk_size(*(Header *)((char *)ptr - sizeof(Header))));
 
-    printf("\n");
-    printf("First free chunk: %p\n", (void *)g_heap.first_free);
     printf("Available memory: %d\n", g_heap.avail);
-    if (g_heap.first_free) {
-        printf("First chunk size: %d\n", unpack_chunk_size(g_heap.first_free->header));
-        printf("First chunk->next: %p\n", offset_to_ptr(g_heap.first_free->next));
-        if (g_heap.first_free > g_heap.start) {
-            printf("Previous chunk size: %d\n", unpack_chunk_size(*((Header *)(g_heap.first_free) - 1)));
-            printf("Previous chunk is_alloc: %d\n", is_alloc(*((Header *)(g_heap.first_free) - 1)));
-        }
-    }
+    print_free_list(&g_heap);
 
-    ptr = heap_alloc(72);
+    ptr = heap_alloc(20);
     printf("\n");
     printf("Allocated addr: %p\n", (void *)ptr);
     if (ptr)
         printf("Allocated size: %d\n", unpack_chunk_size(*(Header *)((char *)ptr - sizeof(Header))));
 
-    printf("\n");
-    printf("First free chunk: %p\n", (void *)g_heap.first_free);
     printf("Available memory: %d\n", g_heap.avail);
-    if (g_heap.first_free) {
-        printf("First chunk size: %d\n", unpack_chunk_size(g_heap.first_free->header));
-        printf("First chunk->next: %p\n", offset_to_ptr(g_heap.first_free->next));
-        if (g_heap.first_free > g_heap.start) {
-            printf("Previous chunk size: %d\n", unpack_chunk_size(*((Header *)(g_heap.first_free) - 1)));
-            printf("Previous chunk is_alloc: %d\n", is_alloc(*((Header *)(g_heap.first_free) - 1)));
-        }
-    }
+    print_free_list(&g_heap);
+
+    HeapChunk *ptr2 = heap_alloc(30);
+    printf("\n");
+    printf("Allocated addr: %p\n", (void *)ptr2);
+    if (ptr2)
+        printf("Allocated size: %d\n", unpack_chunk_size(*(Header *)((char *)ptr2 - sizeof(Header))));
+
+    printf("Available memory: %d\n", g_heap.avail);
+    print_free_list(&g_heap);
+
+    printf("\n");
+    printf("FREEING: %p\n", (void *)ptr);
+
+    heap_free(ptr);
+
+    printf("Available memory: %d\n", g_heap.avail);
+    print_free_list(&g_heap);
+    
+    HeapChunk *ptr3 = heap_alloc(8);
+    printf("\n");
+    printf("Allocated addr: %p\n", (void *)ptr3);
+    if (ptr3)
+        printf("Allocated size: %d\n", unpack_chunk_size(*(Header *)((char *)ptr3 - sizeof(Header))));
+
+    printf("Available memory: %d\n", g_heap.avail);
+    print_free_list(&g_heap);
+
+    HeapChunk *ptr4 = heap_alloc(20);
+    printf("\n");
+    printf("Allocated addr: %p\n", (void *)ptr4);
+    if (ptr4)
+        printf("Allocated size: %d\n", unpack_chunk_size(*(Header *)((char *)ptr4 - sizeof(Header))));
+
+    printf("Available memory: %d\n", g_heap.avail);
+    print_free_list(&g_heap);
+    
 
     return HEAP_OK;
 }
