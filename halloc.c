@@ -1,14 +1,25 @@
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include "halloc.h"
 
 #define ALIGNMENT 16
 #define ALIGN(x) (((x) + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT)
 #define NULL_OFFSET UINT32_MAX
 
-typedef uint32_t Header;
+#define HEADER_SIZE sizeof(Header)
+#define FOOTER_SIZE sizeof(Header)
+#define MIN_CHUNK_SIZE ALIGN(sizeof(HeapChunk) + FOOTER_SIZE)
+
+#define MARK_ALLOC(x) (x) |= 1
+#define MARK_FREE(x) (x) &= ~1
+
+#define ALLOC 1
+#define FREE 0
+
+HeapData g_heap;
 
 static inline Header pack_header(uint32_t chunk_size, bool is_alloc) {
     return (chunk_size & ~1) | is_alloc;
@@ -27,67 +38,6 @@ static inline void add_header_size(Header *header, uint32_t add_size) {
 
     *header = pack_header(unpack_size(*header) + add_size, is_alloc(*header));
 }
-
-#define HEADER_SIZE sizeof(Header)
-#define FOOTER_SIZE sizeof(Header)
-
-#define MARK_ALLOC(x) (x) |= 1
-#define MARK_FREE(x) (x) &= ~1
-
-#define ALLOC 1
-#define FREE 0
-
-/* HeapChunk
- * A chunk of memory on the heap.
- *
- * header defines the size of the chunk.
- * Since chunk size has to be a multiple of 16,
- * the least significant bit of the header is used to
- * indicate whether the chunk is allocated (1) or free (0).
- * Each chunk also has a footer, which is an exact copy of
- * the header placed at the end of the chunk.
- *
- * next and prev are the next and previous element in the free list.
- * They are offsets from the start of the heap,
- * because representing them as 32-bit integers instead
- * of 64-bit pointers reduces the size of HeapChunk from 24 to 12.
- * NULL pointers are represented as UINT32_MAX.
- *
- * When a chunk is allocated, heap_alloc() returns a pointer
- * to the payload, i.e. just after the header.
- * Since only freed chunks need the prev and next pointers,
- * allocated chunks can overwrite them.
- * When freeing a chunk, the position of the previous chunks
- * can be inferred from that chunk's footer.
- * 
- * This means that a whole chunk looks like this:
- * Free:        [ header | next | prev | footer ]
- * Allocated:   [ header | payload | footer ]
- *                       ^ ptr
- */
-typedef struct HeapChunk {
-    Header header;
-    uint32_t next;
-    uint32_t prev;
-} HeapChunk;
-
-#define MIN_CHUNK_SIZE ALIGN(sizeof(HeapChunk) + FOOTER_SIZE)
-
-typedef struct {
-    HeapChunk *start;
-    HeapChunk *first_free;
-    uint32_t size;
-    uint32_t avail;
-    bool is_init;
-} HeapData;
-
-enum HEAP_STATUS {
-    HEAP_OK,
-    HEAP_ERR_MMAP,
-    HEAP_ERR_NULL,
-};
-
-HeapData g_heap;
 
 static inline uint32_t ptr_to_offset(void *ptr) {
     if (!ptr) return NULL_OFFSET;
@@ -305,109 +255,4 @@ void heap_free(void *ptr) {
     }
 
     return;
-}
-
-static void print_free_list(HeapData *heap) {
-    if (!heap) return;
-
-    HeapChunk *curr = heap->first_free;
-
-    if (!curr)
-        printf("(empty)\n");
-
-    while (curr) {
-        printf("Addr: %p\tSize: %u\n", (void *)curr, unpack_size(curr->header));
-        curr = offset_to_ptr(curr->next);
-    }
-    printf("\n");
-}
-
-int main() {
-    heap_init(&g_heap);
-
-    printf("Heap start: %p\n", (void *)g_heap.start);
-    printf("Available memory: %d\n", g_heap.avail);
-
-    print_free_list(&g_heap);
-
-    void *ptr = heap_alloc(8);
-    printf("Allocated addr: %p\n", ptr);
-    if (ptr)
-        printf("Allocated size: %d\n", unpack_size(*(Header *)((char *)ptr - HEADER_SIZE)));
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    void *ptr2 = heap_alloc(30);
-    printf("\n");
-    printf("Allocated addr: %p\n", ptr2);
-    if (ptr2)
-        printf("Allocated size: %d\n", unpack_size(*(Header *)((char *)ptr2 - HEADER_SIZE)));
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    void *ptr3 = heap_alloc(8);
-    printf("\n");
-    printf("Allocated addr: %p\n", ptr3);
-    if (ptr3)
-        printf("Allocated size: %d\n", unpack_size(*(Header *)((char *)ptr3 - HEADER_SIZE)));
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    void *ptr4 = heap_alloc(20);
-    printf("\n");
-    printf("Allocated addr: %p\n", ptr4);
-    if (ptr4)
-        printf("Allocated size: %d\n", unpack_size(*(Header *)((char *)ptr4 - HEADER_SIZE)));
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    void *ptr5 = heap_alloc(3976);
-    printf("\n");
-    printf("Allocated addr: %p\n", ptr5);
-    if (ptr5)
-        printf("Allocated size: %d\n", unpack_size(*(Header *)((char *)ptr5 - HEADER_SIZE)));
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    printf("\n");
-    printf("FREEING: %p\n", (void *)ptr);
-    heap_free(ptr);
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    printf("\n");
-    printf("FREEING: %p\n", (void *)ptr5);
-    heap_free(ptr5);
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    printf("\n");
-    printf("FREEING: %p\n", (void *)ptr2);
-    heap_free(ptr2);
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    printf("\n");
-    printf("FREEING: %p\n", (void *)ptr4);
-    heap_free(ptr4);
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    printf("\n");
-    printf("FREEING: %p\n", (void *)ptr3);
-    heap_free(ptr3);
-
-    printf("Available memory: %d\n", g_heap.avail);
-    print_free_list(&g_heap);
-
-    return HEAP_OK;
 }
